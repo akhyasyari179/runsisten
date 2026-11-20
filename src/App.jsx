@@ -17,6 +17,7 @@ import {
   Gauge, 
   Link2
 } from 'lucide-react';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
 function App() {
   const [showScrollButton, setShowScrollButton] = useState(false);
@@ -120,10 +121,10 @@ useEffect(() => {
 async function loadTrainingData() {
   try {
     const [planResponse, progressResponse] = await Promise.all([
-      fetch('http://localhost:3000/api/training-plan', {
+      fetch(API_URL + '/api/training-plan', {
         credentials: 'include',
       }),
-      fetch('http://localhost:3000/api/training-progress', {
+      fetch(API_URL + '/api/training-progress', {
         credentials: 'include',
       }),
     ]);
@@ -159,8 +160,7 @@ useEffect(() => {
 
   async function checkLoginSession() {
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/auth/me',
+      const response = await fetch(API_URL + '/api/auth/me',
         {
           credentials: 'include',
         }
@@ -230,8 +230,7 @@ useEffect(() => {
     }
 
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/profile',
+      const response = await fetch(API_URL + '/api/profile',
         {
           credentials: 'include',
         }
@@ -340,8 +339,7 @@ useEffect(() => {
 
   async function loadRunRecords() {
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/runs',
+      const response = await fetch(API_URL + '/api/runs',
         {
           credentials: 'include',
         }
@@ -383,8 +381,7 @@ useEffect(() => {
     }
 
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/chat/history',
+      const response = await fetch(API_URL + '/api/chat/history',
         { credentials: 'include' }
       );
 
@@ -434,8 +431,7 @@ useEffect(() => {
     setStravaStatusLoading(true);
 
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/strava/status',
+      const response = await fetch(API_URL + '/api/strava/status',
         { credentials: 'include' }
       );
 
@@ -509,7 +505,7 @@ Ketentuan:
 `
 
     
-const response = await fetch('http://localhost:3000/api/chat/ollama', {
+const response = await fetch(API_URL + '/api/chat/ollama', {
   method: 'POST',
   credentials: 'include',
   headers: {
@@ -750,8 +746,7 @@ const newPlan = {
 
 // Simpan training plan ke database pengguna
 try {
-  const response = await fetch(
-    'http://localhost:3000/api/training-plan',
+  const response = await fetch(API_URL + '/api/training-plan',
     {
       method: 'POST',
       credentials: 'include',
@@ -801,8 +796,7 @@ async function handleTrainingProgressChange(dayName) {
   setTrainingProgress(updatedProgress);
 
   try {
-    const response = await fetch(
-      'http://localhost:3000/api/training-progress',
+    const response = await fetch(API_URL + '/api/training-progress',
       {
         method: 'POST',
         credentials: 'include',
@@ -886,8 +880,7 @@ const greetingName = profile.name?.trim()
   ? profile.name.trim().split(' ')[0]
   : 'Runners';
  async function saveChatMessage(role, message) {
-  const response = await fetch(
-    'http://localhost:3000/api/chat/history',
+  const response = await fetch(API_URL + '/api/chat/history',
     {
       method: 'POST',
       credentials: 'include',
@@ -948,8 +941,7 @@ async function handleSendMessage(event) {
       { role: 'assistant', text: '' },
     ]);
 
-    const response = await fetch(
-      'http://localhost:3000/api/chat/ollama',
+    const response = await fetch(API_URL + '/api/chat/ollama',
       {
         method: 'POST',
         credentials: 'include',
@@ -1061,8 +1053,7 @@ if (assistantReply.trim()) {
     setAuthError('');
 
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/auth/register',
+      const response = await fetch(API_URL + '/api/auth/register',
         {
           method: 'POST',
           headers: {
@@ -1109,8 +1100,7 @@ if (assistantReply.trim()) {
     setAuthError('');
 
     try {
-      const response = await fetch(
-        'http://localhost:3000/api/auth/login',
+      const response = await fetch(API_URL + '/api/auth/login',
         {
           method: 'POST',
           headers: {
@@ -1156,8 +1146,7 @@ loadTrainingData();
   // LOGOUT AKUN
   async function handleLogout() {
     try {
-      await fetch(
-        'http://localhost:3000/api/auth/logout',
+      await fetch(API_URL + '/api/auth/logout',
         {
           method: 'POST',
           credentials: 'include',
@@ -1249,8 +1238,7 @@ async function handleProfileSubmit(event) {
   }
 
   try {
-    const response = await fetch(
-      'http://localhost:3000/api/profile',
+    const response = await fetch(API_URL + '/api/profile',
       {
         method: 'PUT',
         credentials: 'include',
@@ -1292,7 +1280,7 @@ function handleRunChange(event) {
 }
 function handleStravaConnect() {
   window.location.href =
-    'http://localhost:3000/api/strava/connect';
+    `${API_URL}/api/strava/connect`;
 }
 async function handleStravaSync() {
   setStravaLoading(true);
@@ -1300,8 +1288,7 @@ async function handleStravaSync() {
 
   try {
     // Ambil aktivitas dari Strava milik akun yang login
-    const response = await fetch(
-      'http://localhost:3000/api/strava/activities',
+    const response = await fetch(API_URL + '/api/strava/activities',
       { credentials: 'include' }
     );
 
@@ -1333,8 +1320,7 @@ async function handleStravaSync() {
         continue;
       }
 
-      const saveResponse = await fetch(
-        'http://localhost:3000/api/runs',
+      const saveResponse = await fetch(API_URL + '/api/runs',
         {
           method: 'POST',
           headers: {
@@ -1363,8 +1349,7 @@ async function handleStravaSync() {
     }
 
     // Muat ulang riwayat dari database
-    const refreshResponse = await fetch(
-      'http://localhost:3000/api/runs',
+    const refreshResponse = await fetch(API_URL + '/api/runs',
       { credentials: 'include' }
     );
 
@@ -1399,8 +1384,8 @@ async function handleRunSubmit(e) {
   const isEditing = editingRunId !== null;
 
   const url = isEditing
-    ? `http://localhost:3000/api/runs/${editingRunId}`
-    : "http://localhost:3000/api/runs";
+    ? `${API_URL}/api/runs/${editingRunId}`
+    : `${API_URL}/api/runs`;
 
   try {
     const response = await fetch(url, {
@@ -1423,8 +1408,7 @@ async function handleRunSubmit(e) {
       throw new Error(data.error || "Gagal menyimpan catatan lari.");
     }
 
-    const refreshResponse = await fetch(
-      "http://localhost:3000/api/runs",
+    const refreshResponse = await fetch(API_URL + '/api/runs',
       { credentials: "include" }
     );
 
@@ -1459,8 +1443,7 @@ async function handleDeleteRun(id) {
   if (!window.confirm("Hapus catatan lari ini?")) return;
 
   try {
-    const response = await fetch(
-      `http://localhost:3000/api/runs/${id}`,
+    const response = await fetch(`${API_URL}/api/runs/${id}`,
       {
         method: "DELETE",
         credentials: "include",

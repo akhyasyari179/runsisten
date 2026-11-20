@@ -36,10 +36,10 @@ async function createSession(userId, res) {
     [sessionId, userId, expiresAt]
   );
 
-  res.setHeader(
-    "Set-Cookie",
-    `runsisten_session=${sessionToken}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_DURATION / 1000}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`
-  );
+ res.setHeader(
+  "Set-Cookie",
+  `runsisten_session=${sessionToken}; HttpOnly; SameSite=${process.env.NODE_ENV === "production" ? "None" : "Lax"}; Path=/; Max-Age=${SESSION_DURATION / 1000}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`
+);
 }
 
 async function requireAuth(req, res, next) {
