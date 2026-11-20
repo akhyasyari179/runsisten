@@ -1,10 +1,9 @@
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import crypto from "node:crypto";
 import bcrypt from "bcryptjs";
-import db from "./database.js";
+import pool from "./neon.js";
 
 dotenv.config();
 
@@ -20,7 +19,8 @@ app.use(express.json({ limit: "6mb" }));
 const PORT = process.env.PORT || 3000;
 const SESSION_DURATION = 7 * 24 * 60 * 60 * 1000;
 
-function createSession(userId, res) {
+
+async function createSession(userId, res) {
   const sessionToken = crypto.randomBytes(32).toString("hex");
 
   const sessionId = crypto
@@ -30,10 +30,11 @@ function createSession(userId, res) {
 
   const expiresAt = Date.now() + SESSION_DURATION;
 
-  db.prepare(`
-    INSERT INTO sessions (id, user_id, expires_at)
-    VALUES (?, ?, ?)
-  `).run(sessionId, userId, expiresAt);
+  await pool.query(
+    `INSERT INTO sessions (id, user_id, expires_at)
+     VALUES ($1, $2, $3)`,
+    [sessionId, userId, expiresAt]
+  );
 
   res.setHeader(
     "Set-Cookie",
@@ -41,57 +42,69 @@ function createSession(userId, res) {
   );
 }
 
-function requireAuth(req, res, next) {
-  const cookieHeader = req.headers.cookie || "";
+async function requireAuth(req, res, next) {
+  try {
+    const cookieHeader = req.headers.cookie || "";
 
-  const sessionCookie = cookieHeader
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith("runsisten_session="));
+    const sessionCookie = cookieHeader
+      .split(";")
+      .map((item) => item.trim())
+      .find((item) => item.startsWith("runsisten_session="));
 
-  if (!sessionCookie) {
-    return res.status(401).json({
-      error: "Silakan login terlebih dahulu.",
+    if (!sessionCookie) {
+      return res.status(401).json({
+        error: "Silakan login terlebih dahulu.",
+      });
+    }
+
+    const token = sessionCookie.slice("runsisten_session=".length);
+
+    if (!/^[a-f0-9]{64}$/i.test(token)) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid.",
+      });
+    }
+
+    const sessionId = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const result = await pool.query(
+      `SELECT sessions.user_id, users.name, users.email
+       FROM sessions
+       JOIN users ON users.id = sessions.user_id
+       WHERE sessions.id = $1 AND sessions.expires_at > $2`,
+      [sessionId, Date.now()]
+    );
+
+    const session = result.rows[0];
+
+    if (!session) {
+      return res.status(401).json({
+        error: "Sesi login tidak valid atau kedaluwarsa.",
+      });
+    }
+
+    req.user = {
+      id: session.user_id,
+      name: session.name,
+      email: session.email,
+    };
+
+    next();
+  } catch (error) {
+    console.error("Authentication error:", error);
+
+    return res.status(500).json({
+      error: "Gagal memeriksa sesi login.",
     });
   }
-
-  const token = sessionCookie.slice("runsisten_session=".length);
-
-  if (!/^[a-f0-9]{64}$/i.test(token)) {
-    return res.status(401).json({
-      error: "Sesi login tidak valid.",
-    });
-  }
-
-  const sessionId = crypto
-    .createHash("sha256")
-    .update(token)
-    .digest("hex");
-
-  const session = db.prepare(`
-    SELECT sessions.user_id, users.name, users.email
-    FROM sessions
-    JOIN users ON users.id = sessions.user_id
-    WHERE sessions.id = ? AND sessions.expires_at > ?
-  `).get(sessionId, Date.now());
-
-  if (!session) {
-    return res.status(401).json({
-      error: "Sesi login tidak valid atau kedaluwarsa.",
-    });
-  }
-
-  req.user = {
-    id: session.user_id,
-    name: session.name,
-    email: session.email,
-  };
-
-  next();
 }
 // =====================================
 // AUTENTIKASI PENGGUNA RUNSISTEN
 // =====================================
+
 
 // Daftar akun baru
 app.post("/api/auth/register", async (req, res) => {
@@ -119,11 +132,12 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    const existingUser = db.prepare(
-      "SELECT id FROM users WHERE email = ?"
-    ).get(cleanEmail);
+    const existingUser = await pool.query(
+      "SELECT id FROM users WHERE email = $1",
+      [cleanEmail]
+    );
 
-    if (existingUser) {
+    if (existingUser.rows.length > 0) {
       return res.status(409).json({
         error: "Email sudah terdaftar.",
       });
@@ -131,23 +145,33 @@ app.post("/api/auth/register", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const result = db.prepare(`
-      INSERT INTO users (name, email, password_hash)
-      VALUES (?, ?, ?)
-    `).run(cleanName, cleanEmail, passwordHash);
+    const result = await pool.query(
+      `INSERT INTO users (name, email, password_hash)
+       VALUES ($1, $2, $3)
+       RETURNING id, name, email`,
+      [cleanName, cleanEmail, passwordHash]
+    );
 
-    createSession(result.lastInsertRowid, res);
+    const user = result.rows[0];
+
+    await createSession(user.id, res);
 
     res.status(201).json({
       success: true,
       user: {
-        id: result.lastInsertRowid,
-        name: cleanName,
-        email: cleanEmail,
+        id: user.id,
+        name: user.name,
+        email: user.email,
       },
     });
   } catch (error) {
     console.error("Register error:", error);
+
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "Email sudah terdaftar.",
+      });
+    }
 
     res.status(500).json({
       error: "Gagal membuat akun.",
@@ -169,11 +193,14 @@ app.post("/api/auth/login", async (req, res) => {
 
     const cleanEmail = email.trim().toLowerCase();
 
-    const user = db.prepare(`
-      SELECT id, name, email, password_hash
-      FROM users
-      WHERE email = ?
-    `).get(cleanEmail);
+    const result = await pool.query(
+      `SELECT id, name, email, password_hash
+       FROM users
+       WHERE email = $1`,
+      [cleanEmail]
+    );
+
+    const user = result.rows[0];
 
     if (!user) {
       return res.status(401).json({
@@ -192,7 +219,7 @@ app.post("/api/auth/login", async (req, res) => {
       });
     }
 
-    createSession(user.id, res);
+    await createSession(user.id, res);
 
     res.json({
       success: true,
@@ -211,7 +238,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-
 // Periksa sesi login yang sedang aktif
 app.get("/api/auth/me", requireAuth, (req, res) => {
   res.json({
@@ -221,54 +247,65 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
 });
 
 
+
 // Logout
-app.post("/api/auth/logout", (req, res) => {
-  const cookieHeader = req.headers.cookie || "";
+app.post("/api/auth/logout", async (req, res) => {
+  try {
+    const cookieHeader = req.headers.cookie || "";
 
-  const sessionCookie = cookieHeader
-    .split(";")
-    .map((item) => item.trim())
-    .find((item) => item.startsWith("runsisten_session="));
+    const sessionCookie = cookieHeader
+      .split(";")
+      .map((item) => item.trim())
+      .find((item) => item.startsWith("runsisten_session="));
 
-  if (sessionCookie) {
-    const token = sessionCookie.slice(
-      "runsisten_session=".length
+    if (sessionCookie) {
+      const token = sessionCookie.slice(
+        "runsisten_session=".length
+      );
+
+      if (/^[a-f0-9]{64}$/i.test(token)) {
+        const sessionId = crypto
+          .createHash("sha256")
+          .update(token)
+          .digest("hex");
+
+        await pool.query(
+          "DELETE FROM sessions WHERE id = $1",
+          [sessionId]
+        );
+      }
+    }
+
+    res.setHeader(
+      "Set-Cookie",
+      `runsisten_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${process.env.NODE_ENV === "production" ? "; Secure" : ""}`
     );
 
-    if (/^[a-f0-9]{64}$/i.test(token)) {
-      const sessionId = crypto
-        .createHash("sha256")
-        .update(token)
-        .digest("hex");
+    res.json({
+      success: true,
+      message: "Berhasil logout.",
+    });
+  } catch (error) {
+    console.error("Logout error:", error);
 
-      db.prepare(
-        "DELETE FROM sessions WHERE id = ?"
-      ).run(sessionId);
-    }
+    res.status(500).json({
+      error: "Gagal logout.",
+    });
   }
-
-  res.setHeader(
-    "Set-Cookie",
-    `runsisten_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${process.env.NODE_ENV === "production" ? "; Secure" : ""}`
-  );
-
-  res.json({
-    success: true,
-    message: "Berhasil logout.",
-  });
 });
 
 // =====================================
 // RIWAYAT LARI PER PENGGUNA
 // =====================================
 
-// Mengambil riwayat lari milik pengguna yang login
-app.get("/api/runs", requireAuth, (req, res) => {
+
+ // Mengambil riwayat lari milik pengguna yang login
+app.get("/api/runs", requireAuth, async (req, res) => {
   try {
-    const records = db.prepare(`
+    const result = await pool.query(`
       SELECT
         id,
-        source_id AS sourceId,
+        source_id AS "sourceId",
         date,
         distance,
         duration,
@@ -276,13 +313,14 @@ app.get("/api/runs", requireAuth, (req, res) => {
         notes,
         source
       FROM run_records
-      WHERE user_id = ?
+      WHERE user_id = $1
       ORDER BY date DESC, id DESC
-    `).all(req.user.id);
+    `, [req.user.id]);
 
-    res.json(records);
+    res.json(result.rows);
   } catch (error) {
     console.error("Get runs error:", error);
+
     res.status(500).json({
       error: "Gagal mengambil riwayat lari.",
     });
@@ -290,8 +328,8 @@ app.get("/api/runs", requireAuth, (req, res) => {
 });
 
 
-// Menambahkan catatan lari
-app.post("/api/runs", requireAuth, (req, res) => {
+ // Menambahkan catatan lari
+app.post("/api/runs", requireAuth, async (req, res) => {
   try {
     const {
       date,
@@ -339,20 +377,21 @@ app.post("/api/runs", requireAuth, (req, res) => {
     let recordId;
 
     if (source === "strava") {
-      db.prepare(`
+      const saved = await pool.query(`
         INSERT INTO run_records (
           user_id, source_id, date, distance,
           duration, pace, notes, source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT(user_id, source, source_id)
         DO UPDATE SET
-          date = excluded.date,
-          distance = excluded.distance,
-          duration = excluded.duration,
-          pace = excluded.pace,
-          notes = excluded.notes
-      `).run(
+          date = EXCLUDED.date,
+          distance = EXCLUDED.distance,
+          duration = EXCLUDED.duration,
+          pace = EXCLUDED.pace,
+          notes = EXCLUDED.notes
+        RETURNING id
+      `, [
         req.user.id,
         String(source_id),
         date,
@@ -360,39 +399,35 @@ app.post("/api/runs", requireAuth, (req, res) => {
         cleanDuration,
         pace,
         cleanNotes,
-        source
-      );
+        source,
+      ]);
 
-      const saved = db.prepare(`
-        SELECT id FROM run_records
-        WHERE user_id = ? AND source = ? AND source_id = ?
-      `).get(req.user.id, source, String(source_id));
-
-      recordId = saved.id;
+      recordId = saved.rows[0].id;
     } else {
-      const result = db.prepare(`
+      const saved = await pool.query(`
         INSERT INTO run_records (
           user_id, date, distance,
           duration, pace, notes, source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+      `, [
         req.user.id,
         date,
         cleanDistance,
         cleanDuration,
         pace,
         cleanNotes,
-        source
-      );
+        source,
+      ]);
 
-      recordId = Number(result.lastInsertRowid);
+      recordId = saved.rows[0].id;
     }
 
-    const record = db.prepare(`
+    const result = await pool.query(`
       SELECT
         id,
-        source_id AS sourceId,
+        source_id AS "sourceId",
         date,
         distance,
         duration,
@@ -400,15 +435,16 @@ app.post("/api/runs", requireAuth, (req, res) => {
         notes,
         source
       FROM run_records
-      WHERE id = ? AND user_id = ?
-    `).get(recordId, req.user.id);
+      WHERE id = $1 AND user_id = $2
+    `, [recordId, req.user.id]);
 
     res.status(201).json({
       success: true,
-      record,
+      record: result.rows[0],
     });
   } catch (error) {
     console.error("Save run error:", error);
+
     res.status(500).json({
       error: "Gagal menyimpan catatan lari.",
     });
@@ -416,8 +452,8 @@ app.post("/api/runs", requireAuth, (req, res) => {
 });
 
 
-// Mengubah catatan lari milik pengguna
-app.put("/api/runs/:id", requireAuth, (req, res) => {
+ // Mengubah catatan lari milik pengguna
+app.put("/api/runs/:id", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { date, distance, duration, notes } = req.body;
@@ -441,25 +477,27 @@ app.put("/api/runs/:id", requireAuth, (req, res) => {
       });
     }
 
-    const result = db.prepare(`
+    const result = await pool.query(`
       UPDATE run_records
-      SET date = ?,
-          distance = ?,
-          duration = ?,
-          pace = ?,
-          notes = ?
-      WHERE id = ? AND user_id = ? AND source = 'manual'
-    `).run(
+      SET date = $1,
+          distance = $2,
+          duration = $3,
+          pace = $4,
+          notes = $5
+      WHERE id = $6
+        AND user_id = $7
+        AND source = 'manual'
+    `, [
       date,
       Number(distance),
       Number(duration),
       Number(duration) / Number(distance),
       String(notes || "").slice(0, 1000),
       id,
-      req.user.id
-    );
+      req.user.id,
+    ]);
 
-    if (result.changes === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({
         error: "Catatan tidak ditemukan atau tidak dapat diubah.",
       });
@@ -468,6 +506,7 @@ app.put("/api/runs/:id", requireAuth, (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error("Update run error:", error);
+
     res.status(500).json({
       error: "Gagal memperbarui catatan lari.",
     });
@@ -475,8 +514,8 @@ app.put("/api/runs/:id", requireAuth, (req, res) => {
 });
 
 
-// Menghapus catatan lari milik pengguna
-app.delete("/api/runs/:id", requireAuth, (req, res) => {
+ // Menghapus catatan lari milik pengguna
+app.delete("/api/runs/:id", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
 
@@ -486,12 +525,13 @@ app.delete("/api/runs/:id", requireAuth, (req, res) => {
       });
     }
 
-    const result = db.prepare(`
-      DELETE FROM run_records
-      WHERE id = ? AND user_id = ?
-    `).run(id, req.user.id);
+    const result = await pool.query(
+      `DELETE FROM run_records
+       WHERE id = $1 AND user_id = $2`,
+      [id, req.user.id]
+    );
 
-    if (result.changes === 0) {
+    if (result.rowCount === 0) {
       return res.status(404).json({
         error: "Catatan lari tidak ditemukan.",
       });
@@ -500,20 +540,18 @@ app.delete("/api/runs/:id", requireAuth, (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error("Delete run error:", error);
+
     res.status(500).json({
       error: "Gagal menghapus catatan lari.",
     });
   }
 });
 
- // =====================================
- // PROFIL PENGGUNA PER AKUN
- // =====================================
 
-// Mengambil profil pengguna yang sedang login
-app.get("/api/profile", requireAuth, (req, res) => {
+ // Mengambil profil pengguna yang sedang login
+app.get("/api/profile", requireAuth, async (req, res) => {
   try {
-    const profile = db.prepare(`
+    const result = await pool.query(`
       SELECT
         users.name,
         user_profiles.age,
@@ -526,8 +564,10 @@ app.get("/api/profile", requireAuth, (req, res) => {
       FROM users
       LEFT JOIN user_profiles
         ON user_profiles.user_id = users.id
-      WHERE users.id = ?
-    `).get(req.user.id);
+      WHERE users.id = $1
+    `, [req.user.id]);
+
+    const profile = result.rows[0];
 
     res.json({
       success: true,
@@ -539,19 +579,23 @@ app.get("/api/profile", requireAuth, (req, res) => {
         height: profile.height ?? "",
         experience: profile.experience ?? "",
         target: profile.target ?? "",
-        photo: profile.photo ?? ""
-      }
+        photo: profile.photo ?? "",
+      },
     });
   } catch (error) {
     console.error("Get profile error:", error);
+
     res.status(500).json({
-      error: "Gagal mengambil profil pengguna."
+      error: "Gagal mengambil profil pengguna.",
     });
   }
 });
 
-// Menyimpan perubahan profil pengguna
-app.put("/api/profile", requireAuth, (req, res) => {
+
+ // Menyimpan perubahan profil pengguna
+app.put("/api/profile", requireAuth, async (req, res) => {
+  let client;
+
   try {
     const {
       name,
@@ -581,30 +625,34 @@ app.put("/api/profile", requireAuth, (req, res) => {
       });
     }
 
-    const saveProfile = db.transaction(() => {
-      db.prepare(`
-        UPDATE users
-        SET name = ?
-        WHERE id = ?
-      `).run(cleanName, req.user.id);
+    client = await pool.connect();
 
-      db.prepare(`
+    try {
+      await client.query("BEGIN");
+
+      await client.query(`
+        UPDATE users
+        SET name = $1
+        WHERE id = $2
+      `, [cleanName, req.user.id]);
+
+      await client.query(`
         INSERT INTO user_profiles (
           user_id, age, gender, weight, height,
           experience, target, photo, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP)
         ON CONFLICT(user_id)
         DO UPDATE SET
-          age = excluded.age,
-          gender = excluded.gender,
-          weight = excluded.weight,
-          height = excluded.height,
-          experience = excluded.experience,
-          target = excluded.target,
-          photo = excluded.photo,
+          age = EXCLUDED.age,
+          gender = EXCLUDED.gender,
+          weight = EXCLUDED.weight,
+          height = EXCLUDED.height,
+          experience = EXCLUDED.experience,
+          target = EXCLUDED.target,
+          photo = EXCLUDED.photo,
           updated_at = CURRENT_TIMESTAMP
-      `).run(
+      `, [
         req.user.id,
         age === "" || age == null ? null : Number(age),
         gender || null,
@@ -613,38 +661,49 @@ app.put("/api/profile", requireAuth, (req, res) => {
         experience || null,
         target || null,
         photo ?? null
-      );
-    });
+      ]);
 
-    saveProfile();
+      await client.query("COMMIT");
+    } catch (transactionError) {
+      await client.query("ROLLBACK");
+      throw transactionError;
+    }
 
     res.json({
       success: true,
       message: "Profil berhasil disimpan."
     });
+
   } catch (error) {
     console.error("Save profile error:", error);
+
     res.status(500).json({
       error: "Gagal menyimpan profil pengguna."
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
-  });
+});
 
 // =====================================
 // TRAINING PLAN PER PENGGUNA
 // =====================================
 
 
-// MENGAMBIL TRAINING PLAN
-app.get("/api/training-plan", requireAuth, (req, res) => {
+ // MENGAMBIL TRAINING PLAN
+app.get("/api/training-plan", requireAuth, async (req, res) => {
   try {
-    const plan = db.prepare(`
+    const result = await pool.query(`
       SELECT id, plan_data, training_info, created_at
       FROM training_plans
-      WHERE user_id = ?
+      WHERE user_id = $1
       ORDER BY created_at DESC, id DESC
       LIMIT 1
-    `).get(req.user.id);
+    `, [req.user.id]);
+
+    const plan = result.rows[0];
 
     if (!plan) {
       return res.json({ success: true, plan: null });
@@ -660,14 +719,18 @@ app.get("/api/training-plan", requireAuth, (req, res) => {
     });
   } catch (error) {
     console.error("Get training plan error:", error);
+
     res.status(500).json({
       error: "Gagal mengambil training plan."
     });
   }
 });
 
-// MENYIMPAN TRAINING PLAN
-app.post("/api/training-plan", requireAuth, (req, res) => {
+
+ // MENYIMPAN TRAINING PLAN
+app.post("/api/training-plan", requireAuth, async (req, res) => {
+  let client;
+
   try {
     const { data, trainingInfo, createdAt } = req.body;
 
@@ -682,69 +745,97 @@ app.post("/api/training-plan", requireAuth, (req, res) => {
       });
     }
 
-    const savePlan = db.transaction(() => {
-      db.prepare(`
-        DELETE FROM training_progress WHERE user_id = ?
-      `).run(req.user.id);
+    client = await pool.connect();
 
-      db.prepare(`
-        DELETE FROM training_plans WHERE user_id = ?
-      `).run(req.user.id);
+    try {
+      await client.query("BEGIN");
 
-      db.prepare(`
+      await client.query(
+        "DELETE FROM training_progress WHERE user_id = $1",
+        [req.user.id]
+      );
+
+      await client.query(
+        "DELETE FROM training_plans WHERE user_id = $1",
+        [req.user.id]
+      );
+
+      await client.query(`
         INSERT INTO training_plans
           (user_id, plan_data, training_info, created_at)
-        VALUES (?, ?, ?, ?)
-      `).run(
+        VALUES ($1, $2, $3, $4)
+      `, [
         req.user.id,
         JSON.stringify(data),
         JSON.stringify(trainingInfo || {}),
         createdAt || new Date().toISOString()
-      );
-    });
+      ]);
 
-    savePlan();
+      await client.query("COMMIT");
+    } catch (transactionError) {
+      await client.query("ROLLBACK");
+      throw transactionError;
+    }
 
     res.json({
       success: true,
       message: "Training plan berhasil disimpan."
     });
+
   } catch (error) {
     console.error("Save training plan error:", error);
+
     res.status(500).json({
       error: "Gagal menyimpan training plan."
     });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 });
 
-// MENGAMBIL PROGRES LATIHAN
-app.get("/api/training-progress", requireAuth, (req, res) => {
+
+ // MENGAMBIL PROGRES LATIHAN
+app.get("/api/training-progress", requireAuth, async (req, res) => {
   try {
-    const plan = db.prepare(`
-      SELECT id FROM training_plans
-      WHERE user_id = ?
+    const planResult = await pool.query(`
+      SELECT id
+      FROM training_plans
+      WHERE user_id = $1
       ORDER BY created_at DESC, id DESC
       LIMIT 1
-    `).get(req.user.id);
+    `, [req.user.id]);
+
+    const plan = planResult.rows[0];
 
     if (!plan) {
-      return res.json({ success: true, progress: {} });
+      return res.json({
+        success: true,
+        progress: {}
+      });
     }
 
-    const rows = db.prepare(`
+    const result = await pool.query(`
       SELECT day, completed
       FROM training_progress
-      WHERE user_id = ? AND plan_id = ?
-    `).all(req.user.id, plan.id);
+      WHERE user_id = $1 AND plan_id = $2
+    `, [req.user.id, plan.id]);
 
     const progress = {};
-    rows.forEach(row => {
+
+    result.rows.forEach((row) => {
       progress[row.day] = Boolean(row.completed);
     });
 
-    res.json({ success: true, progress });
+    res.json({
+      success: true,
+      progress
+    });
+
   } catch (error) {
     console.error("Get training progress error:", error);
+
     res.status(500).json({
       success: false,
       message: "Gagal mengambil progres latihan."
@@ -752,8 +843,9 @@ app.get("/api/training-progress", requireAuth, (req, res) => {
   }
 });
 
-// MENYIMPAN PROGRES LATIHAN
-app.post("/api/training-progress", requireAuth, (req, res) => {
+
+ // MENYIMPAN PROGRES LATIHAN
+app.post("/api/training-progress", requireAuth, async (req, res) => {
   try {
     const { day, completed } = req.body;
 
@@ -764,12 +856,15 @@ app.post("/api/training-progress", requireAuth, (req, res) => {
       });
     }
 
-    const plan = db.prepare(`
-      SELECT id FROM training_plans
-      WHERE user_id = ?
+    const planResult = await pool.query(`
+      SELECT id
+      FROM training_plans
+      WHERE user_id = $1
       ORDER BY created_at DESC, id DESC
       LIMIT 1
-    `).get(req.user.id);
+    `, [req.user.id]);
+
+    const plan = planResult.rows[0];
 
     if (!plan) {
       return res.status(404).json({
@@ -778,24 +873,26 @@ app.post("/api/training-progress", requireAuth, (req, res) => {
       });
     }
 
-    db.prepare(`
+    await pool.query(`
       INSERT INTO training_progress
         (user_id, plan_id, day, completed, updated_at)
-      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
       ON CONFLICT(user_id, plan_id, day)
       DO UPDATE SET
-        completed = excluded.completed,
+        completed = EXCLUDED.completed,
         updated_at = CURRENT_TIMESTAMP
-    `).run(
+    `, [
       req.user.id,
       plan.id,
       day,
       completed ? 1 : 0
-    );
+    ]);
 
     res.json({ success: true });
+
   } catch (error) {
     console.error("Save training progress error:", error);
+
     res.status(500).json({
       success: false,
       message: "Gagal menyimpan progres latihan."
@@ -810,19 +907,22 @@ app.post("/api/training-progress", requireAuth, (req, res) => {
 const stravaStates = new Map();
 
 // Mengambil token Strava milik pengguna yang sedang login
+
 async function getStravaToken(userId) {
-  let token = db.prepare(`
+  const result = await pool.query(`
     SELECT athlete_id, access_token, refresh_token, expires_at
     FROM strava_tokens
-    WHERE user_id = ?
-  `).get(userId);
+    WHERE user_id = $1
+  `, [userId]);
+
+  let token = result.rows[0];
 
   if (!token) {
     throw new Error("Akun Strava belum terhubung.");
   }
 
   // Refresh token jika hampir kedaluwarsa
-  if (token.expires_at <= Math.floor(Date.now() / 1000) + 60) {
+  if (Number(token.expires_at) <= Math.floor(Date.now() / 1000) + 60) {
     const response = await fetch(
       "https://www.strava.com/api/v3/oauth/token",
       {
@@ -844,18 +944,18 @@ async function getStravaToken(userId) {
       throw new Error("Gagal memperbarui koneksi Strava. Silakan hubungkan ulang.");
     }
 
-    db.prepare(`
+    await pool.query(`
       UPDATE strava_tokens
-      SET access_token = ?,
-          refresh_token = ?,
-          expires_at = ?
-      WHERE user_id = ?
-    `).run(
+      SET access_token = $1,
+          refresh_token = $2,
+          expires_at = $3
+      WHERE user_id = $4
+    `, [
       refreshed.access_token,
       refreshed.refresh_token,
       refreshed.expires_at,
       userId
-    );
+    ]);
 
     token = {
       ...token,
@@ -867,19 +967,32 @@ async function getStravaToken(userId) {
 
   return token;
 }
-// Memeriksa status koneksi Strava akun yang login
-app.get("/api/strava/status", requireAuth, (req, res) => {
-  const token = db.prepare(`
-    SELECT athlete_id
-    FROM strava_tokens
-    WHERE user_id = ?
-  `).get(req.user.id);
 
-  res.json({
-    connected: Boolean(token),
-    athleteId: token?.athlete_id || null,
-  });
+
+ // Memeriksa status koneksi Strava akun yang login
+app.get("/api/strava/status", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT athlete_id
+      FROM strava_tokens
+      WHERE user_id = $1
+    `, [req.user.id]);
+
+    const token = result.rows[0];
+
+    res.json({
+      connected: Boolean(token),
+      athleteId: token?.athlete_id || null,
+    });
+  } catch (error) {
+    console.error("Strava status error:", error);
+
+    res.status(500).json({
+      error: "Gagal memeriksa status koneksi Strava.",
+    });
+  }
 });
+
 // Memulai koneksi Strava — wajib login
 app.get("/api/strava/connect", requireAuth, (req, res) => {
   const state = crypto.randomBytes(32).toString("hex");
@@ -955,28 +1068,29 @@ app.get("/api/strava/callback", requireAuth, async (req, res) => {
       throw new Error("Gagal mendapatkan token Strava.");
     }
 
-    db.prepare(`
-      INSERT INTO strava_tokens (
-        user_id,
-        athlete_id,
-        access_token,
-        refresh_token,
-        expires_at
-      )
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(user_id)
-      DO UPDATE SET
-        athlete_id = excluded.athlete_id,
-        access_token = excluded.access_token,
-        refresh_token = excluded.refresh_token,
-        expires_at = excluded.expires_at
-    `).run(
-      req.user.id,
-      token.athlete?.id ? String(token.athlete.id) : null,
-      token.access_token,
-      token.refresh_token,
-      token.expires_at
-    );
+    
+await pool.query(`
+  INSERT INTO strava_tokens (
+    user_id,
+    athlete_id,
+    access_token,
+    refresh_token,
+    expires_at
+  )
+  VALUES ($1, $2, $3, $4, $5)
+  ON CONFLICT(user_id)
+  DO UPDATE SET
+    athlete_id = EXCLUDED.athlete_id,
+    access_token = EXCLUDED.access_token,
+    refresh_token = EXCLUDED.refresh_token,
+    expires_at = EXCLUDED.expires_at
+`, [
+  req.user.id,
+  token.athlete?.id ? String(token.athlete.id) : null,
+  token.access_token,
+  token.refresh_token,
+  token.expires_at
+]);
 
     res.redirect(
       `${process.env.FRONTEND_URL}/?strava=connected`
@@ -1025,26 +1139,33 @@ app.post("/api/chat/ollama", requireAuth, async (req, res) => {
     const { message, profile, mode } = req.body;
 
     // Ambil ringkasan catatan lari milik akun yang sedang login
-    const runSummary = db.prepare(`
-      SELECT
-        COUNT(*) AS totalRuns,
-        COALESCE(SUM(distance), 0) AS totalDistance,
-        COALESCE(SUM(duration), 0) AS totalDuration,
-        COALESCE(AVG(pace), 0) AS averagePace,
-        COALESCE(MAX(distance), 0) AS longestRun
-      FROM run_records
-      WHERE user_id = ?
-    `).get(req.user.id);
+    
+const summaryResult = await pool.query(`
+  SELECT
+    COUNT(*)::INTEGER AS "totalRuns",
+    COALESCE(SUM(distance), 0) AS "totalDistance",
+    COALESCE(SUM(duration), 0) AS "totalDuration",
+    COALESCE(AVG(pace), 0) AS "averagePace",
+    COALESCE(MAX(distance), 0) AS "longestRun"
+  FROM run_records
+  WHERE user_id = $1
+`, [req.user.id]);
+
+const runSummary = summaryResult.rows[0];
 
     // Ambil 20 aktivitas terbaru
-    const recentRuns = db.prepare(`
-      SELECT date, distance, duration, pace, notes, source
-      FROM run_records
-      WHERE user_id = ?
-      ORDER BY date DESC, id DESC
-      LIMIT 20
-    `).all(req.user.id);
-    console.log("========== DATA LARI COACH WATI ==========");
+    
+const recentRunsResult = await pool.query(`
+  SELECT date, distance, duration, pace, notes, source
+  FROM run_records
+  WHERE user_id = $1
+  ORDER BY date DESC, id DESC
+  LIMIT 20
+`, [req.user.id]);
+
+const recentRuns = recentRunsResult.rows;
+
+console.log("========== DATA LARI COACH WATI ==========");
 console.log("User ID:", req.user.id);
 console.log("Ringkasan:", runSummary);
 console.log("Aktivitas terbaru:", recentRuns.length);
@@ -1261,11 +1382,12 @@ ATURAN STRUKTUR HARI:
 `
   : "";
 
-    const response = await fetch("http://127.0.0.1:11434/api/chat", {
+    const response = await fetch(`${process.env.OLLAMA_PROXY_URL}/api/chat`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-      },
+  "Content-Type": "application/json",
+  "Authorization": `Bearer ${process.env.OLLAMA_PROXY_TOKEN}`,
+},
       body: JSON.stringify({
   model: "qwen2.5:3b",
   stream: true,
@@ -1515,25 +1637,33 @@ try {
 // RIWAYAT CHAT COACH WATI PER PENGGUNA
 // =====================================
 
-// Mengambil riwayat chat akun yang sedang login
-app.get("/api/chat/history", requireAuth, (req, res) => {
+
+ // Mengambil riwayat chat akun yang sedang login
+app.get("/api/chat/history", requireAuth, async (req, res) => {
   try {
-    const messages = db.prepare(`
+    const result = await pool.query(`
       SELECT role, message AS text, created_at
       FROM chat_messages
-      WHERE user_id = ?
+      WHERE user_id = $1
       ORDER BY id ASC
-    `).all(req.user.id);
+    `, [req.user.id]);
 
-    res.json({ success: true, messages });
+    res.json({
+      success: true,
+      messages: result.rows
+    });
   } catch (error) {
     console.error("Get chat history error:", error);
-    res.status(500).json({ error: "Gagal mengambil riwayat chat." });
+
+    res.status(500).json({
+      error: "Gagal mengambil riwayat chat."
+    });
   }
 });
 
-// Menyimpan satu pesan ke akun yang sedang login
-app.post("/api/chat/history", requireAuth, (req, res) => {
+
+ // Menyimpan satu pesan ke akun yang sedang login
+app.post("/api/chat/history", requireAuth, async (req, res) => {
   try {
     const { role, message } = req.body;
 
@@ -1542,18 +1672,24 @@ app.post("/api/chat/history", requireAuth, (req, res) => {
       typeof message !== "string" ||
       !message.trim()
     ) {
-      return res.status(400).json({ error: "Pesan chat tidak valid." });
+      return res.status(400).json({
+        error: "Pesan chat tidak valid."
+      });
     }
 
-    db.prepare(`
+    await pool.query(`
       INSERT INTO chat_messages (user_id, role, message)
-      VALUES (?, ?, ?)
-    `).run(req.user.id, role, message.trim());
+      VALUES ($1, $2, $3)
+    `, [req.user.id, role, message.trim()]);
 
     res.json({ success: true });
+
   } catch (error) {
     console.error("Save chat history error:", error);
-    res.status(500).json({ error: "Gagal menyimpan riwayat chat." });
+
+    res.status(500).json({
+      error: "Gagal menyimpan riwayat chat."
+    });
   }
 });
 app.listen(PORT, () => {
